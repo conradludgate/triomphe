@@ -94,6 +94,19 @@ impl<H, T> ThinArcList<H, T> {
 }
 
 impl<H, T> ThinArcItem<H, T> {
+    pub fn into_raw(self) -> NonNull<WithOffset<T>> {
+        ManuallyDrop::new(self).ptr
+    }
+
+    /// # Safety
+    /// * Must come from as_ref, must have the same H.
+    pub unsafe fn from_raw(ptr: NonNull<WithOffset<T>>) -> Self {
+        Self {
+            ptr,
+            phantom: PhantomData,
+        }
+    }
+
     pub fn as_raw(&self) -> NonNull<WithOffset<T>> {
         self.ptr
     }
@@ -186,130 +199,5 @@ impl<H, T> Drop for ThinArcItem<H, T> {
     #[inline]
     fn drop(&mut self) {
         let _ = unsafe { self.ref_into_parent() };
-    }
-}
-
-pub mod wake {
-    use super::*;
-    use core::task::{RawWaker, Waker};
-
-    pub trait ThinItemWake<H>: Sized {
-        fn wake(this: ThinArcItem<H, Self>) {
-            Self::wake_by_ref(&this);
-        }
-
-        fn wake_by_ref(this: &ThinArcItem<H, Self>);
-    }
-
-    #[cfg(target_has_atomic = "ptr")]
-    impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for Waker {
-        /// Use a [`Wake`]-able type as a `Waker`.
-        ///
-        /// No heap allocations or atomic operations are used for this conversion.
-        fn from(waker: ThinArcItem<H, W>) -> Waker {
-            // SAFETY: This is safe because raw_waker safely constructs
-            // a RawWaker from ThinArcItem<H, W>.
-            unsafe { Waker::from_raw(raw_waker(waker)) }
-        }
-    }
-
-    #[cfg(target_has_atomic = "ptr")]
-    impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for RawWaker {
-        /// Use a `Wake`-able type as a `RawWaker`.
-        ///
-        /// No heap allocations or atomic operations are used for this conversion.
-        fn from(waker: ThinArcItem<H, W>) -> RawWaker {
-            raw_waker(waker)
-        }
-    }
-
-    // NB: This private function for constructing a RawWaker is used, rather than
-    // inlining this into the `From<ThinArcItem<H, W>> for RawWaker` impl, to ensure that
-    // the safety of `From<ThinArcItem<H, W>> for Waker` does not depend on the correct
-    // trait dispatch - instead both impls call this function directly and
-    // explicitly.
-    #[cfg(target_has_atomic = "ptr")]
-    #[inline(always)]
-    fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(
-        waker: ThinArcItem<H, W>,
-    ) -> RawWaker {
-        use core::{
-            ptr::NonNull,
-            task::{RawWaker, RawWakerVTable},
-        };
-
-        // Increment the reference count of the arc to clone it.
-        //
-        // The #[inline(always)] is to ensure that raw_waker and clone_waker are
-        // always generated in the same code generation unit as one another, and
-        // therefore that the structurally identical const-promoted RawWakerVTable
-        // within both functions is deduplicated at LLVM IR code generation time.
-        // This allows optimizing Waker::will_wake to a single pointer comparison of
-        // the vtable pointers, rather than comparing all four function pointers
-        // within the vtables.
-        #[inline(always)]
-        unsafe fn clone_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(
-            waker: *const (),
-        ) -> RawWaker {
-            let waker_ref = unsafe {
-                ManuallyDrop::new(ThinArcItem::<H, W> {
-                    ptr: NonNull::new_unchecked(waker.cast::<WithOffset<W>>().cast_mut()),
-                    phantom: PhantomData,
-                })
-            };
-            let _clone = ManuallyDrop::new(waker_ref.clone());
-
-            RawWaker::new(
-                waker,
-                &RawWakerVTable::new(
-                    clone_waker::<H, W>,
-                    wake::<H, W>,
-                    wake_by_ref::<H, W>,
-                    drop_waker::<H, W>,
-                ),
-            )
-        }
-
-        // Wake by value, moving the Arc into the Wake::wake function
-        unsafe fn wake<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: *const ()) {
-            let waker = unsafe {
-                ThinArcItem::<H, W> {
-                    ptr: NonNull::new_unchecked(waker.cast::<WithOffset<W>>().cast_mut()),
-                    phantom: PhantomData,
-                }
-            };
-            <W as ThinItemWake<H>>::wake(waker);
-        }
-
-        // Wake by reference, wrap the waker in ManuallyDrop to avoid dropping it
-        unsafe fn wake_by_ref<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: *const ()) {
-            let waker = unsafe {
-                ManuallyDrop::new(ThinArcItem::<H, W> {
-                    ptr: NonNull::new_unchecked(waker.cast::<WithOffset<W>>().cast_mut()),
-                    phantom: PhantomData,
-                })
-            };
-            <W as ThinItemWake<H>>::wake_by_ref(&waker);
-        }
-
-        // Decrement the reference count of the Arc on drop
-        unsafe fn drop_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: *const ()) {
-            let _ = unsafe {
-                ThinArcItem::<H, W> {
-                    ptr: NonNull::new_unchecked(waker.cast::<WithOffset<W>>().cast_mut()),
-                    phantom: PhantomData,
-                }
-            };
-        }
-
-        RawWaker::new(
-            ManuallyDrop::new(waker).ptr.as_ptr().cast(),
-            &RawWakerVTable::new(
-                clone_waker::<H, W>,
-                wake::<H, W>,
-                wake_by_ref::<H, W>,
-                drop_waker::<H, W>,
-            ),
-        )
     }
 }

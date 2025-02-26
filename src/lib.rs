@@ -43,6 +43,7 @@ mod arc_union;
 mod header;
 mod iterator_as_exact_size_iterator;
 mod offset_arc;
+pub mod task;
 mod thin_arc;
 mod thin_arc_list;
 mod unique_arc;
