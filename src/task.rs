@@ -6,7 +6,7 @@ use core::{
     task::{RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::ThinArcItem;
+use crate::{ArcItemBorrow, ThinArcItem};
 
 pub trait ThinItemWake<H>: Sized {
     fn wake(this: ThinArcItem<H, Self>) {
@@ -16,7 +16,6 @@ pub trait ThinItemWake<H>: Sized {
     fn wake_by_ref(this: &ThinArcItem<H, Self>);
 }
 
-#[cfg(target_has_atomic = "ptr")]
 impl<H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for Waker {
     /// Use a [`Wake`]-able type as a `Waker`.
     ///
@@ -24,28 +23,34 @@ impl<H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H,
     fn from(waker: ThinArcItem<H, W>) -> Waker {
         // SAFETY: This is safe because raw_waker safely constructs
         // a RawWaker from ThinArcItem<H, W>.
-        unsafe { Waker::from_raw(raw_waker(waker)) }
+        unsafe { Waker::from_raw(RawWaker::from(waker)) }
     }
 }
 
-#[cfg(target_has_atomic = "ptr")]
 impl<H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for RawWaker {
     /// Use a `Wake`-able type as a `RawWaker`.
     ///
     /// No heap allocations or atomic operations are used for this conversion.
     fn from(waker: ThinArcItem<H, W>) -> RawWaker {
-        raw_waker(waker)
+        RawWaker::new(waker.into_raw().as_ptr().cast(), waker_vtable::<H, W>())
     }
 }
 
-#[cfg(target_has_atomic = "ptr")]
 impl<'a, H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<&'a ThinArcItem<H, W>>
     for WakerRef<'a>
 {
     fn from(waker: &'a ThinArcItem<H, W>) -> WakerRef<'a> {
+        Self::from(waker.borrow_arc())
+    }
+}
+
+impl<'a, H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<ArcItemBorrow<'a, H, W>>
+    for WakerRef<'a>
+{
+    fn from(waker: ArcItemBorrow<'a, H, W>) -> WakerRef<'a> {
         let waker = ManuallyDrop::new(unsafe {
             Waker::from_raw(RawWaker::new(
-                waker.as_raw().as_ptr().cast(),
+                waker.0.as_ptr().cast(),
                 waker_vtable::<H, W>(),
             ))
         });
@@ -91,11 +96,6 @@ fn waker_vtable<H, W: ThinItemWake<H> + Send + Sync + 'static>() -> &'static Raw
         wake_by_ref::<H, W>,
         drop_waker::<H, W>,
     )
-}
-
-#[inline(always)]
-fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H, W>) -> RawWaker {
-    RawWaker::new(waker.into_raw().as_ptr().cast(), waker_vtable::<H, W>())
 }
 
 /// A [`Waker`] that is only valid for a given lifetime.
