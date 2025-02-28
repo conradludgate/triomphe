@@ -1,9 +1,14 @@
 use core::{
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
     marker::PhantomData,
     mem::{self, offset_of, ManuallyDrop},
     ops::Deref,
     ptr::{self, NonNull},
 };
+
+use crate::{ArcItemBorrow, HeaderSliceWithLengthUnchecked};
 
 use super::{Arc, ArcInner, HeaderSlice, HeaderWithLength, ThinArc};
 
@@ -91,6 +96,16 @@ impl<H, T> ThinArcList<H, T> {
         });
         f(&transient)
     }
+
+    /// Temporarily converts |self| into a bonafide Arc and exposes it to the
+    /// provided callback. The refcount is not modified.
+    #[inline]
+    pub fn with_arc<F, U>(&self, f: F) -> U
+    where
+        F: FnOnce(&Arc<HeaderSliceWithLengthUnchecked<H, WithOffset<T>>>) -> U,
+    {
+        self.inner.with_arc(f)
+    }
 }
 
 impl<H, T> ThinArcItem<H, T> {
@@ -113,12 +128,17 @@ impl<H, T> ThinArcItem<H, T> {
 
     /// # Safety
     /// * Must come from as_ref, must have the same H.
-    /// * Must not be dropped.
-    pub unsafe fn from_raw_ref(ptr: NonNull<WithOffset<T>>) -> ManuallyDrop<Self> {
-        ManuallyDrop::new(Self {
-            ptr,
-            phantom: PhantomData,
-        })
+    pub unsafe fn from_raw_ref<'a>(ptr: NonNull<WithOffset<T>>) -> ArcItemBorrow<'a, H, T> {
+        ArcItemBorrow(ptr, PhantomData)
+    }
+
+    /// Produce a pointer to the data that can be converted back
+    /// to an ThinArcItem. This is basically an `&ThinArcItem<T>`, without the extra indirection.
+    /// It has the benefits of an `&T` but also knows about the underlying refcount
+    /// and can be converted into more `ThinArcItem<T>`s if necessary.
+    #[inline]
+    pub fn borrow_arc(&self) -> ArcItemBorrow<'_, H, T> {
+        ArcItemBorrow(self.ptr, PhantomData)
     }
 
     pub fn index(&self) -> usize {
@@ -199,5 +219,71 @@ impl<H, T> Drop for ThinArcItem<H, T> {
     #[inline]
     fn drop(&mut self) {
         let _ = unsafe { self.ref_into_parent() };
+    }
+}
+
+impl<H, T: PartialEq> PartialEq for ThinArcItem<H, T> {
+    fn eq(&self, other: &ThinArcItem<H, T>) -> bool {
+        // TODO: pointer equality is incorrect if `T` is not `Eq`.
+        self.ptr == other.ptr || *(*self) == *(*other)
+    }
+
+    #[allow(clippy::partialeq_ne_impl)]
+    fn ne(&self, other: &ThinArcItem<H, T>) -> bool {
+        self.ptr != other.ptr && *(*self) != *(*other)
+    }
+}
+
+impl<H, T: PartialOrd> PartialOrd for ThinArcItem<H, T> {
+    fn partial_cmp(&self, other: &ThinArcItem<H, T>) -> Option<Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+
+    fn lt(&self, other: &ThinArcItem<H, T>) -> bool {
+        *(*self) < *(*other)
+    }
+
+    fn le(&self, other: &ThinArcItem<H, T>) -> bool {
+        *(*self) <= *(*other)
+    }
+
+    fn gt(&self, other: &ThinArcItem<H, T>) -> bool {
+        *(*self) > *(*other)
+    }
+
+    fn ge(&self, other: &ThinArcItem<H, T>) -> bool {
+        *(*self) >= *(*other)
+    }
+}
+
+impl<H, T: Ord> Ord for ThinArcItem<H, T> {
+    fn cmp(&self, other: &ThinArcItem<H, T>) -> Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<H, T: Eq> Eq for ThinArcItem<H, T> {}
+
+impl<H, T: fmt::Display> fmt::Display for ThinArcItem<H, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<H, T: fmt::Debug> fmt::Debug for ThinArcItem<H, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<H, T> fmt::Pointer for ThinArcItem<H, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Pointer::fmt(&self.ptr, f)
+    }
+}
+
+impl<H, T: Hash> Hash for ThinArcItem<H, T> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
+        (**self).hash(state)
     }
 }

@@ -41,7 +41,6 @@ impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for 
 #[inline(always)]
 fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H, W>) -> RawWaker {
     use core::{
-        mem::ManuallyDrop,
         ptr::NonNull,
         task::{RawWaker, RawWakerVTable},
     };
@@ -61,9 +60,9 @@ fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H
     ) -> RawWaker {
         let waker_ptr = unsafe { NonNull::new_unchecked(waker.cast_mut().cast()) };
         let waker_ref = unsafe { ThinArcItem::<H, W>::from_raw_ref(waker_ptr) };
-        let _clone = ManuallyDrop::new(waker_ref.clone());
+        let waker = waker_ref.clone_arc().into_raw();
 
-        RawWaker::new(waker, vtable::<H, W>())
+        RawWaker::new(waker.as_ptr().cast(), vtable::<H, W>())
     }
 
     // Wake by value, moving the Arc into the Wake::wake function
@@ -77,7 +76,7 @@ fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H
     unsafe fn wake_by_ref<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: *const ()) {
         let waker_ptr = unsafe { NonNull::new_unchecked(waker.cast_mut().cast()) };
         let waker_ref = unsafe { ThinArcItem::<H, W>::from_raw_ref(waker_ptr) };
-        <W as ThinItemWake<H>>::wake_by_ref(&waker_ref);
+        waker_ref.with_arc(|a| <W as ThinItemWake<H>>::wake_by_ref(a))
     }
 
     // Decrement the reference count of the Arc on drop
