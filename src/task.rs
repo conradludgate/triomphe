@@ -1,4 +1,10 @@
-use core::task::{RawWaker, Waker};
+use core::{
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::Deref,
+    ptr::NonNull,
+    task::{RawWaker, RawWakerVTable, Waker},
+};
 
 use crate::ThinArcItem;
 
@@ -11,7 +17,7 @@ pub trait ThinItemWake<H>: Sized {
 }
 
 #[cfg(target_has_atomic = "ptr")]
-impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for Waker {
+impl<H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for Waker {
     /// Use a [`Wake`]-able type as a `Waker`.
     ///
     /// No heap allocations or atomic operations are used for this conversion.
@@ -23,7 +29,7 @@ impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for 
 }
 
 #[cfg(target_has_atomic = "ptr")]
-impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for RawWaker {
+impl<H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for RawWaker {
     /// Use a `Wake`-able type as a `RawWaker`.
     ///
     /// No heap allocations or atomic operations are used for this conversion.
@@ -32,28 +38,22 @@ impl<H, W: ThinItemWake<H> + Send + Sync + 'static> From<ThinArcItem<H, W>> for 
     }
 }
 
-// NB: This private function for constructing a RawWaker is used, rather than
-// inlining this into the `From<ThinArcItem<H, W>> for RawWaker` impl, to ensure that
-// the safety of `From<ThinArcItem<H, W>> for Waker` does not depend on the correct
-// trait dispatch - instead both impls call this function directly and
-// explicitly.
 #[cfg(target_has_atomic = "ptr")]
-#[inline(always)]
-fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H, W>) -> RawWaker {
-    use core::{
-        ptr::NonNull,
-        task::{RawWaker, RawWakerVTable},
-    };
-
-    fn vtable<H, W: ThinItemWake<H> + Send + Sync + 'static>() -> &'static RawWakerVTable {
-        &RawWakerVTable::new(
-            clone_waker::<H, W>,
-            wake::<H, W>,
-            wake_by_ref::<H, W>,
-            drop_waker::<H, W>,
-        )
+impl<'a, H: 'static, W: ThinItemWake<H> + Send + Sync + 'static> From<&'a ThinArcItem<H, W>>
+    for WakerRef<'a>
+{
+    fn from(waker: &'a ThinArcItem<H, W>) -> WakerRef<'a> {
+        let waker = ManuallyDrop::new(unsafe {
+            Waker::from_raw(RawWaker::new(
+                waker.as_raw().as_ptr().cast(),
+                waker_vtable::<H, W>(),
+            ))
+        });
+        WakerRef::new_unowned(waker)
     }
+}
 
+fn waker_vtable<H, W: ThinItemWake<H> + Send + Sync + 'static>() -> &'static RawWakerVTable {
     // Increment the reference count of the arc to clone it.
     unsafe fn clone_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(
         waker: *const (),
@@ -62,7 +62,7 @@ fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H
         let waker_ref = unsafe { ThinArcItem::<H, W>::from_raw_ref(waker_ptr) };
         let waker = waker_ref.clone_arc().into_raw();
 
-        RawWaker::new(waker.as_ptr().cast(), vtable::<H, W>())
+        RawWaker::new(waker.as_ptr().cast(), waker_vtable::<H, W>())
     }
 
     // Wake by value, moving the Arc into the Wake::wake function
@@ -85,5 +85,62 @@ fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H
         let _ = unsafe { ThinArcItem::<H, W>::from_raw(waker_ptr) };
     }
 
-    RawWaker::new(waker.into_raw().as_ptr().cast(), vtable::<H, W>())
+    &RawWakerVTable::new(
+        clone_waker::<H, W>,
+        wake::<H, W>,
+        wake_by_ref::<H, W>,
+        drop_waker::<H, W>,
+    )
+}
+
+#[inline(always)]
+fn raw_waker<H, W: ThinItemWake<H> + Send + Sync + 'static>(waker: ThinArcItem<H, W>) -> RawWaker {
+    RawWaker::new(waker.into_raw().as_ptr().cast(), waker_vtable::<H, W>())
+}
+
+/// A [`Waker`] that is only valid for a given lifetime.
+///
+/// Note: this type implements [`Deref<Target = Waker>`](std::ops::Deref),
+/// so it can be used to get a `&Waker`.
+#[derive(Debug)]
+pub struct WakerRef<'a> {
+    waker: ManuallyDrop<Waker>,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> WakerRef<'a> {
+    /// Create a new [`WakerRef`] from a [`Waker`] reference.
+    #[inline]
+    pub fn new(waker: &'a Waker) -> Self {
+        // copy the underlying (raw) waker without calling a clone,
+        // as we won't call Waker::drop either.
+        let waker = ManuallyDrop::new(unsafe { core::ptr::read(waker) });
+        Self {
+            waker,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Create a new [`WakerRef`] from a [`Waker`] that must not be dropped.
+    ///
+    /// Note: this if for rare cases where the caller created a [`Waker`] in
+    /// an unsafe way (that will be valid only for a lifetime to be determined
+    /// by the caller), and the [`Waker`] doesn't need to or must not be
+    /// destroyed.
+    #[inline]
+    pub fn new_unowned(waker: ManuallyDrop<Waker>) -> Self {
+        Self {
+            waker,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl Deref for WakerRef<'_> {
+    type Target = Waker;
+
+    #[inline]
+    fn deref(&self) -> &Waker {
+        &self.waker
+    }
 }
