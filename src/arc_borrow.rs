@@ -4,6 +4,8 @@ use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::ptr::NonNull;
 
+use crate::{ThinArcItem, ThinArcList, WithOffset};
+
 use super::Arc;
 
 /// A "borrowed `Arc`". This is a pointer to
@@ -138,10 +140,130 @@ unsafe impl<'lt, T: 'lt, U: ?Sized + 'lt> unsize::CoerciblePtr<U> for ArcBorrow<
     }
 }
 
+/// A "borrowed `ThinArcItem`". This is a pointer to
+/// a T that is known to have been allocated within an
+/// `ThinArcList`.
+///
+/// This is equivalent in guarantees to `&ThinArcItem<T>`, however it is
+/// a bit more flexible. To obtain an `&ThinArcItem<T>` you must have
+/// an `ThinArcItem<T>` instance somewhere pinned down until we're done with it.
+/// It's also a direct pointer to `T`, so using this involves less pointer-chasing
+///
+/// However, C++ code may hand us refcounted things as pointers to T directly,
+/// so we have to conjure up a temporary `ThinArcItem` on the stack each time.
+///
+/// `ArcItemBorrow` lets us deal with borrows of known-refcounted objects
+/// without needing to worry about where the `ThinArcItem<T>` is.
+#[derive(Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct ArcItemBorrow<'a, H: 'a, T: 'a>(
+    pub(crate) NonNull<WithOffset<T>>,
+    pub(crate) PhantomData<&'a (H, T)>,
+);
+
+unsafe impl<'a, H: Sync + Send, T: Sync + Send> Send for ArcItemBorrow<'a, H, T> {}
+unsafe impl<'a, H: Sync + Send, T: Sync + Send> Sync for ArcItemBorrow<'a, H, T> {}
+
+impl<'a, H, T> Copy for ArcItemBorrow<'a, H, T> {}
+impl<'a, H, T> Clone for ArcItemBorrow<'a, H, T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, H, T> ArcItemBorrow<'a, H, T> {
+    /// Clone this as an `Arc<T>`. This bumps the refcount.
+    #[inline]
+    pub fn clone_arc(&self) -> ThinArcItem<H, T> {
+        self.with_arc(|a| a.clone())
+    }
+
+    // /// For constructing from a pointer known to be Arc-backed,
+    // /// e.g. if we obtain such a pointer over FFI
+    // ///
+    // // TODO: should from_ptr be relaxed to unsized types? It can't be
+    // // converted back to an Arc right now for unsized types.
+    // //
+    // /// # Safety
+    // /// - The pointer to `T` must have come from a Triomphe `Arc`, `UniqueArc`, or `ArcItemBorrow`.
+    // /// - The pointer to `T` must have full provenance over the `Arc`, `UniqueArc`, or `ArcItemBorrow`,
+    // ///   in particular it must not have been derived from a `&T` reference, as references immediately
+    // ///   loose all provenance over the adjacent reference counts. As of this writing,
+    // ///   of the 3 types, only Trimphe's `Arc` offers a direct API for obtaining such a pointer:
+    // ///   [`Arc::as_ptr`].
+    // #[inline]
+    // pub unsafe fn from_ptr(ptr: *const T) -> Self {
+    //     unsafe { ArcItemBorrow(NonNull::new_unchecked(ptr as *mut T), PhantomData) }
+    // }
+
+    /// Compare two `ArcItemBorrow`s via pointer equality. Will only return
+    /// true if they come from the same allocation
+    #[inline]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.0 == other.0
+    }
+
+    /// The reference count of the underlying `Arc`.
+    ///
+    /// The number does not include borrowed pointers,
+    /// or temporary `Arc` pointers created with functions like
+    /// [`ArcItemBorrow::with_arc`].
+    ///
+    /// The function is called `strong_count` to mirror `std::sync::Arc::strong_count`,
+    /// however `triomphe::Arc` does not support weak references.
+    #[inline]
+    pub fn strong_count(this: &Self) -> usize {
+        Self::with_arc(this, |arc| {
+            arc.with_parent(|arc| arc.with_arc(Arc::strong_count))
+        })
+    }
+
+    /// Temporarily converts |self| into a bonafide Arc and exposes it to the
+    /// provided callback. The refcount is not modified.
+    #[inline]
+    pub fn with_arc<F, U>(&self, f: F) -> U
+    where
+        F: FnOnce(&ThinArcItem<H, T>) -> U,
+    {
+        // Synthesize transient Arc, which never touches the refcount.
+        let transient = unsafe { ManuallyDrop::new(ThinArcItem::from_raw(self.0)) };
+
+        // Expose the transient Arc to the callback, which may clone it if it wants
+        // and forward the result to the user
+        f(&transient)
+    }
+
+    /// Similar to deref, but uses the lifetime |a| rather than the lifetime of
+    /// self, which is incompatible with the signature of the Deref trait.
+    #[inline]
+    pub fn get(&self) -> &'a T {
+        unsafe { &(*self.0.as_ptr()).value }
+    }
+}
+
+impl<'a, H, T> Deref for ArcItemBorrow<'a, H, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        self.get()
+    }
+}
+
 #[test]
 fn clone_arc_borrow() {
     let x = Arc::new(42);
     let b: ArcBorrow<'_, i32> = x.borrow_arc();
     let y = b.clone_arc();
     assert_eq!(x, y);
+}
+
+#[test]
+fn clone_arc_item_borrow() {
+    let x = ThinArcList::from_header_and_iter(42, std::iter::once(43));
+    let y = x.with_item(0, |x| x.clone());
+    let b: ArcItemBorrow<'_, i32, i32> = y.borrow_arc();
+    let z = b.clone_arc();
+    assert_eq!(y, z);
 }

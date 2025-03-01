@@ -40,7 +40,7 @@ pub struct ThinArc<H, T> {
     // The safe API of `ThinArc` ensures that the length in the `HeaderWithLength`
     // corretcly set - or verified - upon creation of a `ThinArc` and can't be modified
     // to fall out of sync with the true slice length for this value & allocation.
-    ptr: ptr::NonNull<ArcInner<HeaderSlice<HeaderWithLength<H>, [T; 0]>>>,
+    pub(super) ptr: ptr::NonNull<ArcInner<HeaderSlice<HeaderWithLength<H>, [T; 0]>>>,
     phantom: PhantomData<(H, T)>,
 }
 
@@ -143,6 +143,19 @@ impl<H, T> ThinArc<H, T> {
         );
 
         ret
+    }
+
+    /// Creates a `ThinArc` for a HeaderSlice using the given header struct and
+    /// iterator to generate the slice.
+    pub fn header_from_iter<I, F>(items: I, f: F) -> Self
+    where
+        I: Iterator<Item = T> + ExactSizeIterator,
+        F: FnOnce(&mut [T]) -> H,
+    {
+        let len = items.len();
+        Arc::into_thin(Arc::header_from_iter(items, |i| {
+            HeaderWithLength::new(f(i), len)
+        }))
     }
 
     /// Creates a `ThinArc` for a HeaderSlice using the given header struct and
